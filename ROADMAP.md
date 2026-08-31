@@ -19,24 +19,87 @@
 
 ---
 
+## 🎯 整體優先順序建議(前端 + DevOps 合併排序)
+
+> 你的定位是「近期前端為主、DevOps 加分」,所以排序邏輯是:**先補「面試必考、你本來會但生疏」的東西(投入小、回報快)**,**再補「完全不會的新技能」**,**最後才是需要長時間堆的 DevOps 深水區**。
+
+| 順位 | 項目 | 為什麼排這裡 |
+|---|---|---|
+| 🔴 1 | Vue 底層原理 + 面試題庫 | 你天天在用,只是「講得出原理」跟「會用」是兩回事;複習成本最低、面試 CP 值最高 |
+| 🔴 2 | JavaScript 底層原理(event loop / closure / prototype / this) | 跟 Vue 底層同一類「用不到但忘了會很尷尬」,而且是**所有前端面試的地基題**,沒特別列在你原本的訴求裡,但重要性不亞於 Vue 底層 |
+| 🔴 3 | 瀏覽器 / 網路協議 | 你明確要的;這塊複習完可以跟 DevOps 的「網路 / gateway / TLS」知識串起來,一魚兩吃 |
+| 🟡 4 | Testing(Vitest / Playwright) | 公司沒用過,完全空白,但幾乎所有中大型公司面試都會問「你們怎麼測試」——現在補這塊比臨場硬凹划算 |
+| 🟡 5 | React 重新學 | 忘光了,重建成本最高,所以排在「複習類」後面;但補了能讓應徵的職缺池直接翻倍(很多公司 React-first) |
+| 🟢 6 | DevOps 短期優先(K8s 手寫、CI/CD、容器化) | 你已經有 K8s 部署觸發 + Kong 的實戰經驗,這裡是「從會用到會設計」的深化,不是從零開始,ROI 也不錯 |
+| 🟢 7 | DevOps 中期(IaC、雲端、證照) | 需要比較長的養成時間,適合排在把面試地基補完之後 |
+| 🔵 8 | 加分項(Web Vitals / a11y / GraphQL / DSA) | 錦上添花,視你實際投的職缺再挑要不要做 |
+
+---
+
 ## 一、前端補強
 
-### 短期優先(3-6 個月,投報率最高)
+### 🔴 立即優先 — 你本來會、但底層原理生疏(面試高頻)
+
+#### Vue 底層原理 + 常見面試題庫
+
+- [ ] 響應式系統:Vue2 `Object.defineProperty` vs Vue3 `Proxy` 的差異、各自的限制(陣列 index 賦值偵測不到、新增屬性偵測不到)
+- [ ] `ref` vs `reactive` 底層差異 — 為什麼 `ref` 要 `.value`?template 裡為什麼不用寫 `.value`(自動解包的編譯期處理)
+- [ ] 依賴收集機制:`track`/`trigger`、`WeakMap<target, Map<key, Set<effect>>>` 的資料結構,講得出「改一個屬性怎麼知道要通知誰重新渲染」
+- [ ] `computed` 的 lazy + cache(dirty flag)原理,跟 `watch`/`watchEffect` 的差異與各自使用時機
+- [ ] Virtual DOM diff:Vue3 key-based diff(最長遞增子序列優化)vs Vue2 雙端比較;**為什麼 v-for 一定要加 key、不加會怎樣**(經典題)
+- [ ] Vue3 編譯期優化:static hoisting、patchFlag、block tree — 這是 Vue3 比 Vue2 快的關鍵,常被問「Vue3 為什麼比較快」
+- [ ] `nextTick` 原理(跟 microtask queue、DOM 批次更新的關係)
+- [ ] `provide`/`inject` 底層、`defineProps`/`defineEmits` 這些 compiler macro 編譯後長什麼樣子
+- [ ] `keep-alive` / `Teleport` 原理(你在 GS-5646 踩過 ClientTeleport 的坑,可以直接整理成面試故事,比背書更有說服力)
+- [ ] SSR hydration 原理 — 這個你在 Astro/gnar 有大量實戰(hydration mismatch 排錯經驗),整理成一段可以講的故事,面試常被問「SSR 怎麼運作」
+
+#### JavaScript 底層原理(補充項,跟 Vue 底層同等重要,但不在你原本清單裡)
+
+- [ ] Event loop:macrotask vs microtask,`Promise`/`async-await` 的執行順序(這題幾乎每場面試都會考一段 code 讓你猜輸出順序)
+- [ ] 閉包(closure)運作原理 + 常見記憶體洩漏情境
+- [ ] Prototype chain、`class` 語法糖底層是什麼、`this` 的四種綁定規則 + arrow function 為什麼不綁定 `this`
+- [ ] 手寫題常客:防抖(debounce)/節流(throttle)、簡易版 `Promise`、深拷貝
+- [ ] `Promise.all` / `allSettled` / `race` / `any` 的差異與使用情境
+- [ ] V8 記憶體管理概念(mark-and-sweep、世代回收)— 了解概念即可,不用背細節
+
+#### 瀏覽器 / 網路協議(你明確要的)
+
+- [ ] **經典題**:網址列輸入到畫面出現,完整走一遍 —— DNS 解析 → TCP 三次握手 → TLS 握手(https)→ HTTP request/response → HTML parse → 建 DOM/CSSOM → Render Tree → Layout → Paint → Composite → JS 執行(遇到 `<script>` 的阻塞行為、`defer`/`async` 差異)
+- [ ] TCP 三次握手 / 四次揮手,為什麼是三次不是兩次
+- [ ] TLS/SSL 握手流程(非對稱加密交換金鑰 → 之後用對稱加密傳輸、憑證鏈驗證)
+- [ ] HTTP/1.1(隊頭阻塞)vs HTTP/2(多工複用、header 壓縮)vs HTTP/3(改用 QUIC/UDP)—— 三代差異跟各自解決的問題
+- [ ] 快取機制:強快取(`Cache-Control`/`Expires`)vs 協商快取(`ETag`/`Last-Modified`),兩者怎麼配合用
+- [ ] Cookie vs LocalStorage vs SessionStorage vs IndexedDB —— 容量、生命週期、是否跟著 request 送出的差異
+- [ ] 同源政策(Same-Origin Policy)+ CORS 運作機制(simple request vs preflight `OPTIONS`)
+- [ ] 前端資安基礎:XSS(儲存型/反射型/DOM-based)、CSRF、CSP(`Content-Security-Policy`)—— 這塊剛好能跟你 GS-8192 遇過的資安 sub-bug(source map 外洩)接起來當實戰案例
+- [ ] Reflow vs Repaint 差異、為什麼改 `transform`/`opacity` 比改 `width`/`top` 便宜(渲染管線的合成層概念)
+
+### 🟡 中期 — 目前完全不熟,需要重新建立
 
 - [ ] Vitest 單元測試 — 挑一個現有專案的元件/composable 補測試
 - [ ] Playwright e2e 測試 — 針對一個完整 user flow(如 login / withdrawal)寫一組 e2e
+- [ ] React 基礎重學 —— 建議路線:
+  - [ ] Function component + Hooks(`useState`/`useEffect`/`useMemo`/`useCallback`/`useRef`/`useContext`)
+  - [ ] 搞懂跟 Vue 最大的心智模型差異:React 是「state 改變 → 整個 component 重新執行」,Vue 是「細粒度追蹤,只更新真的變動的部分」——這個對比本身就是很好的面試素材
+  - [ ] JSX 語法、跟 Vue template 的差異
+  - [ ] Reconciliation / Fiber 架構 —— 可以跟 Vue diff 放在一起記,面試常兩個一起問
+  - [ ] 常見陷阱:`useEffect` 裡抓到舊值的 stale closure、依賴陣列漏寫
+  - [ ] 狀態管理:知道 Redux / Zustand / Context API 的差異跟取捨(不用精通,能聊優缺點即可)
+  - [ ] 實際寫一個小專案(todo app 或串一個 public API)驗證自己真的會寫,不是只看得懂
+
+### 🔵 加分 / 依應徵職缺再決定要不要做
+
 - [ ] Core Web Vitals / Lighthouse — 對現有專案跑一次分析,寫下 3 個可改善點並實際改
-
-### 中期
-
-- [ ] React 基礎 — 能看懂、能寫一個小專案(不需要精通,面試能聊即可)
 - [ ] 無障礙(a11y) — WCAG 基本規範、ARIA attribute,挑一個頁面做無障礙檢查
 - [ ] Build 工具設定能力 — 自己從零設定一次 Vite/webpack config,理解每個選項的作用
 - [ ] GraphQL — 了解與 REST 的差異,寫一個小 demo(query + mutation)
+- [ ] 資料結構與演算法(LeetCode 風格)— 只有應徵大公司 / 外商才需要重壓,一般前端職缺 CP 值偏低,視目標公司再決定要不要投入
 
 ---
 
 ## 二、DevOps 補強
+
+> 整體排序見最上方「🎯 整體優先順序建議」——這裡的短/中/長期是 DevOps 賽道自己的內部順序,實際安排時建議先把上面前端 🔴 立即優先做完再回來這裡。
 
 ### 短期優先(3-6 個月)
 
