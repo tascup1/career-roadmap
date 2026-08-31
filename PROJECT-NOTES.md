@@ -1,7 +1,7 @@
-# 公司專案筆記 — 架構演進史 + CI/CD 流程
+# 公司專案筆記 — 架構演進史 + CI/CD + K8s/Kong 流程
 
 > 建立日期:2026-08-31
-> 用途:公司專案(backroom / arena / gnar)的架構脈絡 + CI/CD 流程備忘,幫助記憶、分享用。學習路線圖拆到 [ROADMAP.md](./ROADMAP.md)。
+> 用途:公司專案(backroom / arena / gnar)的架構脈絡 + CI/CD 流程 + K8s/Kong 運作備忘,幫助記憶、分享用。學習路線圖拆到 [ROADMAP.md](./ROADMAP.md)。
 > 標示慣例:✅ 已查證(翻過 git log / commit / 檔案內容確認過)、🗣 記憶,未查證(純粹憑印象,沒有或無法找到證據佐證,分享時請自行斟酌措辭)。
 
 ---
@@ -192,3 +192,158 @@ backroom 根目錄的 `ci-config/*.yaml`(`stages.yaml` / `base-image.yaml` / `bu
 
 1. **CI(建置驗證)這段**:確認 2024 年中(arena)/ 2023 年中(backroom)左右,各專案陸續從搬進 monorepo 前用的系統(推測是 Jenkins,但只有間接佐證)切到 **GitLab CI 原生 runner**。這段你的記憶方向正確。
 2. **CD(部署)這段**:現況完全不是「GitLab CI 直接部署」這種常見的一條龍 GitOps 模式,而是 **GitLab CI 只管建 image + 推 registry,部署是另一套獨立系統**(AWX + Ansible + Jsonnet + Rancher)。這段你原本的問法沒特別提到,但既然你要完整流程,補在這裡——面試被問「你們 CI/CD 怎麼做」的時候,這個「CI 跟 CD 是兩個系統」的細節本身就是一個值得講的架構特徵,跟很多教學文章預設的「GitLab CI 一路做到 kubectl apply」不一樣,講出來反而顯得你真的懂公司的實際架構,不是背書。
+
+---
+
+## K8s 實際在做什麼 + Kong 是什麼(2026-08-31 補充)
+
+> 延續上面 CI/CD 那段繼續往下挖,查證範圍主要是 `kubernetes-deployment` repo 裡 `pod/`(K8s 物件樣板)跟 `configmap/`(每個 app 灌進去的設定值)兩個資料夾。
+
+### 一、K8s 整體架構(✅ 已查證)
+
+雲端環境是 **AWS**(從資源命名跟節點設定看得出來,細節見下)。從 `deployment.template.libsonnet` 這份 pod 樣板可以看到:
+
+- **節點類型有兩種可切換**:`fargate`(預設,AWS 的無伺服器容器模式,不用自己管節點)跟 `ec2`(自管節點群組,這種才需要額外設定 `tolerations`(容忍特定節點的汙點,只有指定 node group 才能排程上去)+ `topologySpreadConstraints`(強制 pod 分散到不同可用區,避免整組服務因單一 AZ 掛掉而全滅))
+- Image 一律從 **Harbor**(私有 container registry)拉,`imagePullSecrets` 指定 `hsof-harbor` 這組憑證
+- 排程限制在 `amd64` 架構節點(沒有用 ARM/Graviton 這類省錢機型)
+
+**Namespace 規劃**:每個「環境 × 品牌」組合是一個獨立 K8s namespace(從 `configmap/configs/{brand}/{env}/` 這種資料夾結構可以看出),例如 sp 品牌的 QAT 環境、wb 品牌的 Production 環境,各自獨立 namespace、獨立資源配額、獨立一個 Kong 實例(下面細講)。
+
+### 二、K8s 用到哪些物件(✅ 已查證,從 `pod/templates/` 樣板逐一確認)
+
+| 物件 | 用途 | 從樣板看到的細節 |
+|---|---|---|
+| **Deployment** | 跑 pod 本體 | `RollingUpdate` 策略(`maxSurge` 預設 50%、`maxUnavailable` 預設 0——滾動更新時允許多開 50% 新 pod,但不允許少一個舊 pod,確保服務不中斷)、`revisionHistoryLimit: 1`(只留 1 個舊版本 ReplicaSet,不像預設值留 10 個佔資源)、副本數直接取自 HPA 的 `minReplicas` |
+| **Service** | 讓其他服務找得到這個 pod | `ClusterIP` 型別,`port 80 → targetPort 64132`——**64132 這個 port 我實際去查了 gnar 的 `astro.config.mjs`,dev server 設定的 port 也是 64132,完全對上**,代表 pod 裡跑的就是本機開發時同一套 server,只是包進容器 |
+| **HPA**(HorizontalPodAutoscaler) | 自動依負載調整副本數 | 有獨立樣板檔,`minReplicas`/`maxReplicas` 由每個 app 自己的 spec 檔決定,沒有全域統一數字 |
+| **PDB**(PodDisruptionBudget) | 節點維護 / rolling upgrade 時保底可用副本數 | 有獨立樣板檔;有專屬 playbook 邏輯是「副本數 == 1 時自動刪掉 PDB」——單副本本來就沒有「維持最低可用數」的意義,留著反而會擋住維護操作 |
+| **Job** | 一次性任務 | 有獨立樣板檔,對應像 static asset 上傳、遷移腳本這類跑一次就結束、不需要常駐的工作 |
+| **ConfigMap** | 灌進每個環境/品牌各自的設定值 | `configmap/templates/{brand}/app.properties.template.j2`——每個品牌一份,裡面是**上百行** `ApiClient_*` 這種後端服務網址設定(下面 Kong 那段細講) |
+| **ServiceAccount** | 給 pod 存取叢集資源的權限 | 依用途拆開多份,例如某個跨 namespace 的維運工具特意不沿用既有的共用 SA,避免權限範圍被放大 |
+
+**沒看到的東西,值得記一下**:整個 repo 找不到 `kind: Ingress` 被廣泛使用(只有一個維運小工具動態建立過),也完全沒有 Helm chart 的痕跡(用的是 Jsonnet,不是 Helm 的 template 語法),更沒有 ArgoCD / Flux 這類 GitOps 工具的設定——這三點呼應你 ROADMAP 裡列的 DevOps 學習項目,現況公司用的是比較「傳統」的 Ansible + 樣板渲染 + 手動觸發模式,不是時下教學文章常預設的 Helm + GitOps 組合。
+
+### 三、部署怎麼觸發到這些物件上(接前面 CI/CD 章節)
+
+已經在上面 CI/CD 章節講過完整鏈路:**AWX(操作員手動觸發 job template)→ Ansible playbook → Jsonnet 把這些樣板渲染成真正的 K8s manifest → 透過 Rancher 包的 `kubectl apply` 套用**。不是 push-based GitOps(沒有東西持續監看 git 狀態自動同步到叢集),是操作員主動跑一次才會部署一次,細節見上方「二、現在的 CI」跟「三、CD 的新舊兩套部署模型」兩節。
+
+### 四、Kong 是什麼
+
+Kong 是一個 **API Gateway**(以 Nginx 為底層核心、外面包一層可插拔的 plugin 系統的反向代理伺服器),放在「呼叫方」跟「真正的後端服務」中間,核心職責:
+
+- **路徑路由(routing)**:依 URL path 前綴,把請求轉發到對應的後端服務——呼叫方只需要知道一個 Kong 入口網址,不需要知道每個服務實際跑在哪個 IP / port,新增或搬遷服務時呼叫方完全不用改設定
+- **Prefix 剝除(strip path)**:轉發前把路徑前綴拿掉,後端服務收到的是「乾淨」的路徑,不需要知道自己是掛在哪個 prefix 底下被存取的——這點在 `application.spec.libsonnet` 的一段真實 code 註解直接寫明:「Kong 會剝除 support page 的 prefix,本服務收到的路徑從 / 開始」
+- **(Kong 的標準能力,但這次沒查到你們實際開了哪些)**:rate limiting、認證外掛(JWT/OAuth 驗證可以在 Kong 這層擋掉,不用每個後端服務各自實作)、logging/metrics 外掛。Kong 本身的部署方式、route/service/plugin 設定**不在 `kubernetes-deployment` 這個 repo 裡**,查不到——這塊列為 🗣 待補,也剛好呼應你 ROADMAP 裡把「Kong 的 route/plugin/rate-limit 機制」列成要補的東西:現況你們是從「應用端設定去指到 Kong」這個角度在用 Kong,不是自己動手設定 Kong 本身的路由規則,這兩者是不同的知識面
+
+### 五、你們的 Kong 實際在做什麼(✅ 已查證,從 configmap 樣板挖到的)
+
+每個 namespace 有自己專屬的一個 Kong,內部 DNS 命名是 `{namespace}-operation-kong.nlb.local`(`nlb.local` 是 AWS 內部 Network Load Balancer 的內部網域,不對外)。從 `configmap/templates/sp/app.properties.template.j2` 這份設定檔(內容會被灌進每個 BO app 的 ConfigMap,啟動時讀取)可以看到,**幾十個後端微服務全部都是透過這個 Kong 轉發**,呼叫方完全不直接連後端服務的 IP:
+
+```mermaid
+flowchart LR
+  classDef app fill:#1f6f3f,color:#fff
+  classDef kong fill:#7a5c00,color:#fff
+  classDef svc fill:#123a6e,color:#fff
+
+  BO["BO 前端 / dotnet 後端<br/>(讀 ConfigMap 灌進來的 ApiClient_* 網址)"]:::app
+  Kong["{namespace}-operation-kong.nlb.local<br/>(每個 namespace 各一個)"]:::kong
+  P1["portal-api"]:::svc
+  P2["payment-workbench-api"]:::svc
+  P3["authentication-api"]:::svc
+  P4["...(共 20+ 個微服務,見下方清單)"]:::svc
+  Web["affiliate-workbench-website / backoffice-workbench-website / ...<br/>(BO 網站本身,舊部署模型下也走 Kong)"]:::svc
+
+  BO -->|"/portal-api/api/*"| Kong --> P1
+  BO -->|"/payment-workbench-api/api/*"| Kong --> P2
+  BO -->|"/authentication-api/api/*"| Kong --> P3
+  BO -->|"/*-api/api/*"| Kong --> P4
+  BO -->|"/*-workbench-website/*"| Kong --> Web
+```
+
+實際看到的後端服務(節錄自 `app.properties.template.j2`,共 20+ 個):`portal-api`、`player-api`、`wallet-api`、`payment-workbench-api`、`authentication-api`、`cs-workbench-api`、`marketing-api`、`backoffice-organization-api`、`turnover-api`、`wager-api`、`report-workbench-api`、`affiliate-workbench-api`、`notification-api`、`affiliate-portal-api`、`it-operation-api`、`maintenance-workbench-api`、`payment-integration-api`、`risk-control-api`、`entrix-worker`/`entrix-api`/`entrix-operation-api`、`thirdparty-api`。
+
+而且不只 API——**BO 各站台本身的網站服務**(`affiliate-workbench-website`、`backoffice-workbench-website`、`crm-workbench-website`、`kyc-workbench-website`、`marketing-website`、`payment-workbench-website`、`report-workbench-website` 等)也是透過同一個 Kong 用路徑轉發,這對應的正是前面 CI/CD 章節講的「舊部署模型」(dotnet 網站 + 共用 PVC)——Kong 把對外的公開網址轉成內部路徑,再轉發給對應服務。
+
+另外查到一個**不屬於這個 Kong 體系**的東西,值得留意:遊戲產品(Arcade / Casino / NumberGame / Slot / Sportsbook / P2P / EBingo / Specialty / PaymentGateway)的 API 是走另一個叫 `ig_load_balancer` 的負載平衡器,跟 GPF 這邊的 `{namespace}-operation-kong` 是分開的系統——這應該是另一個團隊(IG,可能是遊戲內容供應商相關團隊)自己的基礎設施,不在你們的維護範圍。
+
+**跟你已經知道的東西接起來**:你在 GS-5646(arena → gnar portal 遷移)踩過的規則「arena `/api/*` → gnar `/portal/api/*`」,現在可以更完整解釋了——`/portal/api/*` 這個 prefix 不是憑空定的命名慣例,路徑命名邏輯跟這裡查到的 `ApiClient_Portal=http://.../portal-api/api` 這條 Kong route 高度一致。
+
+⚠ **但要誠實講清楚查證邊界**:`configmap` 這份設定看到的,是 **BO 後端(dotnet)呼叫內部微服務**用的 Kong route;跟**玩家瀏覽器直接打**的 `/portal/api/*`,是不是走同一個 Kong 實例、同一組 route 設定,這次沒有找到直接證據可以 100% 確認是同一層——兩者路徑命名邏輯一致到很難是巧合,但嚴謹地說這是**推論,不是查證到的事實**。分享的時候建議講成「命名邏輯高度一致,可能是同一套 Kong 路由慣例」,不要斷言完全相同的系統。
+
+### 六、K8s + Kong 合起來看的完整請求路徑
+
+以「玩家打開 gnar portal 頁面、頁面 JS 呼叫一個 API」為例,把 K8s Service 跟 Kong 兩層分開畫,避免混成一條:
+
+```mermaid
+sequenceDiagram
+  participant U as 玩家瀏覽器
+  participant Svc as K8s Service(ClusterIP,80→64132)
+  participant Pod as gnar portal Pod
+  participant Kong as Kong({namespace}-operation-kong)
+  participant BE as 後端微服務(如 portal-api)
+
+  U->>Svc: 進站請求(實際對外入口層本次沒有直接查證,略過不猜測)
+  Svc->>Pod: 依 Service selector 轉發到某個 pod
+  Pod-->>U: 回傳頁面(HTML + JS)
+  U->>Kong: 頁面 JS 呼叫 /portal/api/xxx
+  Kong->>Kong: 依 path prefix 找到對應 route,剝除 prefix
+  Kong->>BE: 轉發乾淨路徑 /xxx 給對應後端服務
+  BE-->>Kong: 回應
+  Kong-->>U: 回應
+```
+
+「**拿到頁面**」(瀏覽器 → K8s Service → Pod)跟「**頁面載入後打 API**」(瀏覽器 → Kong → 後端微服務)是兩件不同的事、走不同路徑——這個區分本身就是面試常被問的「靜態資源 vs API 通常走不同路徑」的一個活生生的例子,可以直接拿公司架構當例子講。
+
+> 圖裡「玩家瀏覽器 → K8s Service」這一段,對外真正的入口層(是不是有 CDN、有沒有額外的 nginx/ingress 層)這次沒有查到直接證據,故意沒有畫出來、也沒有寫死——不確定的地方寧可留白,不要腦補一個聽起來合理的架構圖。
+
+---
+
+## GTM(Google Tag Manager)相關(2026-08-31 補充)
+
+> 查證範圍:gnar `apps/portal/src/composable/useGtm.ts` + 所有實際呼叫點。GTM 只在**玩家 portal(gnar)** 有實作,backroom(BO 後台)完全沒有——查過 backroom 全部 app,唯一命中都只是 `pnpm-lock.yaml` 裡的間接套件依賴,不是真的用到,符合預期(GTM 是行銷/轉換追蹤工具,BO 內部操作工具本來就不需要)。
+
+### 一、GTM 是什麼
+
+GTM 本身**不是**分析工具,是一層「標籤容器(tag container)」——它站在「網站事件」跟「各種第三方追蹤工具(GA4、廣告平台的轉換追蹤、Facebook Pixel 等)」中間:
+
+- FE 只需要負責把「使用者做了什麼事」這個事實,用一個共通格式(`window.dataLayer` 陣列)push 出去
+- 真正「這個事件要不要轉發給 GA4」「要不要同時觸發某個廣告平台的轉換 pixel」這些決策,是行銷 / 產品團隊在 **GTM 後台**設定 trigger + tag 規則決定的,**不需要改 FE code**
+- 這是它跟「直接在 code 裡串 GA4 SDK」最大的差異:GTM 把「觸發事件」跟「這個事件要送去哪裡」兩件事解耦,FE 端的職責只到「push 一個 event 進 dataLayer」為止
+
+### 二、你們的實作方式(✅ 已查證,gnar `useGtm.ts`)
+
+- **Bootstrap 注入**:`inject(gtmId)` 動態建立標準 GTM 安裝片段——`<head>` 塞一段 `<script src="https://www.googletagmanager.com/gtm.js?id=...">`,`<body>` 開頭塞對應的 `<noscript><iframe>`(給 JS 被停用的情境用)。是標準 Google 官方安裝片段,只是用 JS 動態插入而不是寫死在 HTML 模板裡
+- **事件推送**:`pushEvent(event, params)` 就是把一個物件 push 進 `window.dataLayer`,GTM 容器自己監聽這個陣列的變化,依後台設定的規則決定要不要轉發
+- **啟用時機跟身份都不是寫死的**:GTM 容器 ID(`gtmId`)跟是否啟用(`isEnableGtm`)是 app 啟動時打 init API 拿回來的(`platform.tracking.gtmId` / `platform.tracking.isEnableGtm`),代表**不同租戶/品牌可以各自開關、各自接不同的 GTM 容器**——直接對應你們整體的多租戶架構,GTM 這層也沒有例外
+- **呼叫順序**:整段邏輯掛在 `StoreHydrationView.vue`(app 啟動流程的控制中心)——`initData.run()`(拿 init 資料)→ 判斷 `gtmId && isEnableGtm` 才呼叫 `gtm.inject()` → 標記 app 初始化完成,讓其他等待初始化的元件可以繼續。旁邊有一個姊妹 composable `useClarity`(Microsoft Clarity,另一個 session-recording/分析工具),bootstrap 注入手法幾乎一樣,只是目前只做安裝、還沒有像 GTM 這樣有自訂事件推送的需求
+
+### 三、目前實際在追蹤哪些事件(✅ 已查證,`GtmEvent` enum 共 13 個值 + 逐一核對呼叫點)
+
+| Event | 觸發時機 | 觸發檔案 |
+|---|---|---|
+| `signup_success` | 一般玩家(非 MPBL)完成註冊 | `RegisterSuccessPage.vue` |
+| `mpbl_signup_success` | MPBL 玩家完成註冊 | `RegisterSuccessPage.vue` |
+| `redeposit_success` / `first_deposit_success` | 存款完成(分「非首次」/「首次」兩種) | `DepositSelectProviderPage.vue` |
+| `mpbl_first_deposit` | MPBL 玩家首次存款 | `DepositSelectProviderPage.vue` |
+| `kyc_completed` | 玩家送出 KYC 文件(兩種 KYC 流程各自觸發同一個 event) | `KycFormPage.vue`、`KycElectronicStepTwo.vue` |
+| `game_entry_click` | 玩家點任一遊戲入口,帶 `game_category`(sportsbook/casino/slot/poker_p2p/mpbl/ebingo)+ `location`(home_quick_access/navigation_game_filter/hamburger_menu)+ `user_status`(登入/訪客)三個參數 | `LobbyProducts.vue`、`GamesBottomSheet.vue`、`HeaderProductMenuItem.vue`——**三個不同入口共用同一個 event name,靠參數區分來源**,不是各開一個 event |
+| `mpbl_click_signup` | Header 上引導 MPBL 訪客註冊的按鈕被點 | `Header.vue` |
+| `mpbl_click_deposit` | Header profile menu 引導 MPBL 玩家存款的項目被點 | `HeaderProfileMenu.vue` |
+| `mpbl_click_view_odds` | MPBL 直播頁點「看賠率」| `MpblLiveStreamSection.vue` |
+| `mpbl_live_play` | MPBL 直播影片開始播放 | `MpblLiveStreamSection.vue` |
+| `mpbl_video_play` | MPBL 重播影片開始播放(三處播放器都觸發同一個 event) | `MpblLiveStreamSection.vue`、`MpblReplaySection.vue`、`MpblReplayDisplayAll.vue` |
+| `mpbl_live_video_watched_30_mins` | MPBL 直播被觀看滿 30 分鐘的里程碑事件 | `useYoutubeTimeTracker.ts`(獨立的 YouTube 播放時長追蹤 composable) |
+
+**附帶發現**:enum 裡還定義了一個 `mpbl_page_view`,但**整個 codebase 找不到任何地方真的呼叫它**。可能原因(沒有查到直接證據,列為待確認):預留給未來用,或者頁面瀏覽本來就是 GTM 內建的 Page View trigger 在自動處理,不需要自訂 push——GTM 標準用法裡,單純頁面瀏覽通常靠容器內建 trigger 就夠,只有需要更細緻區分時才會自己 push 一個 page_view event。
+
+🗣 **一個沒查證的猜測,分享時請說清楚是猜的**:大量事件掛 `mpbl` 前綴,看起來是圍繞某個特定產品線(MPBL,猜測跟籃球聯賽相關)在做比較密集的行銷歸因/轉換追蹤,可能是這條產品線有獨立的行銷投放預算需要驗證轉換效果——這段純粹是看 event 分布量猜的,沒有找到明確的 ticket 或文件佐證。
+
+### 四、這段程式碼的演進脈絡(✅ 已查證,直接寫在 code 註解裡)
+
+- `useGtm.ts` 本身是 GS-5646(arena → gnar 遷移)期間從 arena 逐一 port 過來的,comment 裡明確標了對照來源,例如「arena `RegisterSuccess.vue` line 57」「arena `use-gtm.ts` GTM events」——這是前面「Portal migration」章節提到的遷移工程,GTM 這塊也是被遷移範圍之一
+- `inject()` 這個 bootstrap 注入功能原本是獨立的 `useGtmInjection` composable,後來(GS-6788 R6 Phase F2)合併進 `useGtm`,變成同一個 composable 同時管「安裝」跟「推事件」兩件事,理由是讓 GTM 相關邏輯只有一個進入點
+- `game_entry_click` 是後來(GS-7009)才加的新事件,而且是**三個不同入口共用同一個 event name、靠參數區分來源**的設計——這是個不錯的「事件設計」範例可以拿去面試講:不是每加一個新入口就開一個新 event name,而是先問「這件事的本質是不是同一件事」,是的話就共用 event、用參數分流,event 數量不會隨入口數量線性膨脹
+
+### 五、GTM 跟前面 K8s/Kong 那段的關係——完全是兩個世界
+
+GTM 這條路徑**完全不經過**你們自己的 K8s/Kong 架構:`gtm.js` 直接從 Google 的網域(`googletagmanager.com`)載入,`dataLayer` push 純粹是瀏覽器端的 JS 陣列操作,資料最終轉發到哪裡是 GTM 容器依後台設定決定的,不會打到你們自己的任何 K8s Service。跟前面 K8s/Kong 段落講的是完全獨立的兩個系統——一個是你們自己維運、部署、監控的後端服務網路,一個是完全委外給 Google 管理的第三方追蹤層。
